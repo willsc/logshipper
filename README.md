@@ -2,7 +2,7 @@
 
 A Rust daemon that tails live local logs or archives settled log files to **Amazon FSx for NetApp ONTAP or OpenZFS mounted over NFS on the same Linux host**. It treats files as bytes, so text, JSON, JSON Lines, binary logs, and existing compressed files use the same pipeline.
 
-**Start with [DEPLOYMENT.md](DEPLOYMENT.md)** for host installation, NFS setup, permissions, monitoring, acceptance tests, and rollback. The daemon does not provision AWS resources or mount NFS itself.
+**Start with [Step-by-step deployment](#step-by-step-deployment)** below to install and run the service. [DEPLOYMENT.md](DEPLOYMENT.md) provides the detailed resource tuning, acceptance tests, maintenance, and rollback procedures. The daemon does not provision AWS resources or mount NFS itself.
 
 ## Application isolation and backpressure
 
@@ -27,7 +27,244 @@ Prompt live reads will often hit the OS page cache. That is not guaranteed: olde
 
 Source files are retained. The daemon neither deletes nor truncates them.
 
-## Quick start
+## Step-by-step deployment
+
+These instructions cover a fresh installation on a Linux/systemd host using **FSx ONTAP or OpenZFS over NFS**. For an existing installation, follow the [upgrade and rollback procedure](DEPLOYMENT.md#10-upgrade-and-rollback) before replacing the binary or state.
+
+Use these example values consistently, replacing them with your deployment's values:
+
+| Value | Example | What to supply |
+| --- | --- | --- |
+| Local application logs | `/var/log/myapp` | An existing local directory containing active and rotated logs |
+| FSx mountpoint | `/mnt/fsx` | The exact NFS mountpoint on this host |
+| NFS export | `FSX_DNS_NAME:/EXPORT_PATH` | Your ONTAP SVM or OpenZFS endpoint and volume export path |
+| Writer namespace | `prod-app-01` | A stable name unique to this host/writer |
+| Local state | `/var/lib/logshipper` | Persistent local storage, separate from the source and FSx |
+
+Keep the application writing to its **local log directory** throughout deployment and operation. Those files buffer an FSx outage; retain them for the maximum outage plus catch-up time and a capacity margin. Only logshipper should access FSx for shipping.
+
+### 1. Prepare the host
+
+You need sudo access, an existing FSx NFS export, and working DNS, routing, security groups, and export permissions between this host and FSx. No AWS API credentials are needed by the daemon.
+
+On Ubuntu, install the build tools, NFS client, ACL tools, and utilities used below:
+
+```sh
+sudo apt-get update
+sudo apt-get install -y build-essential pkg-config python3 git curl nfs-common acl zstd
+```
+
+On Amazon Linux 2023, use this instead:
+
+```sh
+sudo dnf install -y gcc gcc-c++ make pkgconf-pkg-config python3 git curl-minimal nfs-utils acl zstd
+```
+
+Install **Rust 1.89 or newer** using your approved toolchain distribution process. If Rust is absent and you use the official [rustup installer](https://doc.rust-lang.org/book/ch01-01-installation.html), run it as your build user, without sudo, and accept the default stable toolchain:
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+. "$HOME/.cargo/env"
+```
+
+Check that the compiler and Cargo are available and meet the minimum version:
+
+```sh
+rustc --version
+cargo --version
+```
+
+Build on the target host or a build host with the same architecture and compatible glibc. If using a separately built, qualified release bundle, skip step 2; the target needs the NFS/ACL tools and verification utilities, but does not need Rust or a C compiler.
+
+### 2. Build a release bundle
+
+From a directory where you keep source checkouts:
+
+```sh
+git clone https://github.com/willsc/logshipper.git
+cd logshipper
+cargo test --locked
+bash scripts/build-release.sh
+```
+
+If you already have this repository checked out, start in its root and run the last two commands. The build creates a native release archive and checksum file in `dist/`. Release qualification also includes the checks under [Release and validation](#release-and-validation).
+
+### 3. Install the bundle
+
+The commands below use version `0.2.0` on `x86_64`; substitute the filename produced by your build (`aarch64` for an ARM build). If built elsewhere, copy the archive and its trusted checksum file to the target and enter that directory instead of `dist/`.
+
+```sh
+cd dist
+sha256sum --check logshipper-0.2.0-linux-x86_64.tar.gz.sha256
+tar -xzf logshipper-0.2.0-linux-x86_64.tar.gz
+cd logshipper-0.2.0-linux-x86_64
+sudo bash install.sh
+```
+
+Run `install.sh` from the **extracted release bundle**. The installer creates the `logshipper` service account, installs `/usr/local/bin/logshipper` and the systemd unit, creates `/var/lib/logshipper`, and installs the example as `/etc/logshipper/config.toml`. It preserves an existing configuration and leaves the service stopped on a fresh installation. If your organisation assigns numeric service UID/GID values, provision that account before running the installer.
+
+### 4. Mount the FSx export
+
+If FSx is already mounted at the intended path, inspect it with `findmnt` below and check its persistent mount configuration. Otherwise, create a root-owned mountpoint and edit `/etc/fstab`:
+
+```sh
+sudo install -d -m 0755 -o root -g root /mnt/fsx
+sudoedit /etc/fstab
+```
+
+Add this entry, replacing `FSX_DNS_NAME:/EXPORT_PATH` with the actual endpoint/export. This is an NFSv4.1 starting configuration; use the mount options supported by your FSx volume and client as described in the [NFS setup guide](DEPLOYMENT.md#3-install-the-nfs-client-and-mount-fsx).
+
+```fstab
+FSX_DNS_NAME:/EXPORT_PATH /mnt/fsx nfs vers=4.1,hard,timeo=600,retrans=2,rsize=1048576,wsize=1048576,noresvport,_netdev,nofail 0 0
+```
+
+Load the updated mount configuration, mount the export if it is not already mounted, and inspect it:
+
+```sh
+sudo systemctl daemon-reload
+sudo mount /mnt/fsx
+findmnt --mountpoint /mnt/fsx -o TARGET,SOURCE,FSTYPE,OPTIONS
+nfsstat -m
+findmnt -n -o SOURCE --mountpoint /mnt/fsx
+```
+
+Save the exact `SOURCE` from the last command for step 6. Confirm that the filesystem is `nfs` or `nfs4` with `hard` recovery and server-coordinated locking. The daemon rejects soft mounts and local-only locking.
+
+Keep the unmounted local directory unwritable by `logshipper`. The service intentionally has no mount prerequisite: it can start while FSx is absent. It retries shipping when the mount returns, but **does not mount FSx itself**. Arrange for your host mount management or operations procedure to retry a failed mount; `nofail` alone does not schedule retries.
+
+### 5. Grant source and destination permissions
+
+Inspect the installed service identity:
+
+```sh
+id logshipper
+```
+
+Have the NFS export administrator create `logshipper/prod-app-01` on the export, owned by this numeric UID/GID with mode `0700` or an approved shared-group equivalent. Parent directories must allow reading and traversal. Root squash/export policies can prevent client-side root from changing remote ownership; provision permissions on the actual export through your storage administration process.
+
+Grant read/traverse access to existing local logs and inherited access for newly created logs. This ACL example keeps application ownership unchanged:
+
+```sh
+sudo setfacl -R -m u:logshipper:rX /var/log/myapp
+sudo find /var/log/myapp -type d -exec setfacl -m d:u:logshipper:rX '{}' +
+sudo -u logshipper test -r /var/log/myapp/application.log
+sudo -u logshipper test -w /mnt/fsx/logshipper/prod-app-01
+```
+
+Replace `application.log` with an existing application log. Both `test` commands should exit successfully without output. Check source parent-directory traversal and repeat the read check after rotation: restrictive file creation modes can mask inherited ACL permissions. Logshipper needs no write access to source logs.
+
+### 6. Configure the daemon
+
+```sh
+sudoedit /etc/logshipper/config.toml
+```
+
+For a live-tail deployment, the following is a complete starting configuration. Replace the source path, mountpoint, namespace, and `expected_source`; the latter must exactly match step 4's `findmnt` output. Replace the file contents with this example rather than appending duplicate TOML sections.
+
+```toml
+state_dir = "/var/lib/logshipper"
+scan_interval_seconds = 30
+buffer_bytes = 262144
+checkpoint_bytes = 67108864
+min_state_free_bytes = 67108864
+
+[destination]
+mount_path = "/mnt/fsx"
+directory = "logshipper"
+namespace = "prod-app-01"
+require_mount = true
+allowed_filesystems = ["nfs", "nfs4"]
+expected_source = "FSX_DNS_NAME:/EXPORT_PATH"
+min_free_bytes = 1073741824
+
+[io]
+read_bytes_per_second = 20971520
+write_bytes_per_second = 10485760
+operations_per_second = 100
+scan_entries_per_second = 100
+
+[compression]
+format = "zstd"
+level = 3
+skip_compressed = true
+
+[monitoring]
+listen = "127.0.0.1:9898"
+stall_seconds = 300
+
+[tail]
+poll_seconds = 1
+flush_seconds = 5
+mem_buf_limit = 8388608
+segment_bytes = 1048576
+
+[[sources]]
+name = "application"
+path = "/var/log/myapp"
+mode = "tail"
+include = ["**/*.log", "**/*.log.*", "**/*.json", "**/*.json.*", "**/*.jsonl", "**/*.jsonl.*"]
+exclude = ["**/*.tmp", "**/*.partial"]
+```
+
+Match the include patterns to **active and retained rotated logs**. New files are read from byte zero, including any existing backlog. Use rename-and-create rotation and keep unread rotated files. For settled whole-file archives instead, set `mode = "archive"` and select only closed, rotated files. Choose `format = "none"` to disable compression or `"gzip"` for gzip; recognized compressed inputs pass through when `skip_compressed = true`.
+
+This starts with read/write ceilings of 20/10 MiB/s and one 1 MiB segment in flight, within an 8 MiB payload limit. The systemd unit also sets low CPU/I/O priority, a 50% CPU quota, and a 512 MiB memory ceiling. Tune against application latency and backlog growth; [resource budgeting](DEPLOYMENT.md#6-establish-resource-and-retention-budgets) explains hard local block-device limits. Payload limits do not cap the entire process RSS.
+
+### 7. Validate configuration and first delivery
+
+Validate using the same identity as the service:
+
+```sh
+sudo -u logshipper /usr/local/bin/logshipper --config /etc/logshipper/config.toml --check-config
+```
+
+Expect `Configuration is valid`. This checks configuration and source directories without requiring FSx or modifying state; it does not prove that NFS writes work.
+
+With FSx mounted and a nonempty matching log present, run one scan **before starting the service**:
+
+```sh
+sudo -u logshipper /usr/local/bin/logshipper --config /etc/logshipper/config.toml --once --json
+sudo -u logshipper find /mnt/fsx/logshipper/prod-app-01/application -name receipt.json -print -quit
+```
+
+Copy the receipt path printed by `find` into the verification command below, replacing `PREFIX/ID`:
+
+```sh
+sudo -u logshipper /usr/local/bin/logshipper --verify /mnt/fsx/logshipper/prod-app-01/application/PREFIX/ID/receipt.json
+```
+
+Expect a `Verified ...` result. `--once` sends at most one eligible segment per tail file; it does not drain an entire backlog. If no receipt appears, check file patterns, source permissions, and the JSON output. Do not run `--once` concurrently with the service against the same state/namespace. If FSx is currently unavailable, defer the delivery check; the continuous service in step 8 can still start and wait.
+
+### 8. Enable the service and check monitoring
+
+```sh
+sudo systemctl enable --now logshipper
+sudo systemctl status logshipper --no-pager
+sudo journalctl -u logshipper -n 50 --no-pager
+curl --fail http://127.0.0.1:9898/healthz
+curl --fail http://127.0.0.1:9898/readyz
+curl --fail http://127.0.0.1:9898/metrics
+```
+
+Expect an active service, HTTP 200 from both health endpoints once a scan succeeds, and Prometheus metrics. `/healthz` can remain 200 while `/readyz` is 503 during an FSx outage or a stalled transfer; this is expected while the application continues writing locally. Use `sudo journalctl -u logshipper -f` to follow delivery/retry logs. Keep the unauthenticated monitoring listener on loopback and scrape it with a local monitoring agent.
+
+### 9. Complete rollout checks and routine operations
+
+Before production rollout, run the [FSx acceptance tests](DEPLOYMENT.md#8-acceptance-tests-on-the-actual-fsx-host) on a dedicated canary host/export. Confirm that local application writes continue during missing-mount and NFS outages, payload memory stays bounded, backlog reading pauses, and delivery/checksum verification recover after FSx returns. The repository's private tmpfs mount test does not replace these real-NFS checks.
+
+Install the [example alert rules](packaging/alerts.yml) in your monitoring system and add source-disk capacity and backlog-age alerts. Allow enough local retention for outage and catch-up; the daemon never deletes source logs. Include `/var/lib/logshipper` in the [stopped-service state backup procedure](DEPLOYMENT.md#10-upgrade-and-rollback).
+
+After configuration changes, validate and restart:
+
+```sh
+sudo -u logshipper /usr/local/bin/logshipper --config /etc/logshipper/config.toml --check-config
+sudo systemctl restart logshipper
+sudo systemctl status logshipper --no-pager
+```
+
+To stop shipping, run `sudo systemctl stop logshipper`. The application continues writing its local logs; preserve those logs and the local state so shipping can resume. See [troubleshooting](DEPLOYMENT.md#9-routine-operations-and-troubleshooting) for mount, permission, capacity, and stalled-worker failures.
+
+## Development quick start
 
 Build on Linux with Rust 1.89+ and a C compiler/native build tools. The validated development compiler is recorded in each release's `build-info.json`. SQLite and Zstandard are compiled from bundled sources. FSx access uses the mounted filesystem and the service account's permissions; AWS API credentials are unnecessary.
 
