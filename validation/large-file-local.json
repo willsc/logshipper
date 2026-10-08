@@ -1,0 +1,23 @@
+{
+  "date": "2026-10-08",
+  "application_version": "0.1.0",
+  "build_profile": "release",
+  "purpose": "Verify streaming across the 4 GiB boundary, bounded process memory, and lossless multi-frame Zstandard output",
+  "input_description": "Sparse zero-filled file with binary markers at the beginning and end",
+  "filesystem": "Local test directories; no FSx mount involved",
+  "input_bytes": 5368709137,
+  "stored_bytes": 165644,
+  "read_bytes_per_second_limit": 134217728,
+  "write_bytes_per_second_limit": 134217728,
+  "operations_per_second_limit": 100000,
+  "buffer_bytes": 262144,
+  "checkpoint_bytes": 67108864,
+  "compression": "zstd",
+  "compression_level": 3,
+  "elapsed_seconds": 48.88,
+  "peak_rss_kib": 10524,
+  "measurement": "/usr/bin/time around the daemon process; verification processes excluded",
+  "round_trip_sha256": "526defae682cbe4167f6d7b312b575aabb0c1fe755c759d872c9f1a3b0a31bd6",
+  "verified": true,
+  "limitation": "Synthetic highly compressible input; not a disk, FSx throughput, or production compression-ratio benchmark"
+}

@@ -1,0 +1,31 @@
+[package]
+name = "logshipper"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Bounded-I/O, resumable log archiving to a mounted filesystem"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+ctrlc = { version = "3", features = ["termination"] }
+flate2 = "1"
+globset = "0.4"
+hex = "0.4"
+libc = "0.2"
+rusqlite = { version = "0.38", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+walkdir = "2"
+zstd = "0.13"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+strip = true

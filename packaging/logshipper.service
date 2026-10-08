@@ -1,0 +1,45 @@
+[Unit]
+Description=Resumable log archiving to FSx
+Documentation=file:/usr/local/share/doc/logshipper/README.md
+Documentation=file:/usr/local/share/doc/logshipper/DEPLOYMENT.md
+After=network-online.target
+Wants=network-online.target
+# No mount requirement: the daemon must start and wait even when FSx is absent.
+
+[Service]
+Type=simple
+User=logshipper
+Group=logshipper
+StateDirectory=logshipper
+StateDirectoryMode=0700
+ExecStart=/usr/local/bin/logshipper --config /etc/logshipper/config.toml --json
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=90
+UMask=0077
+Nice=10
+IOSchedulingClass=idle
+IOAccounting=true
+IOWeight=10
+CPUAccounting=true
+CPUQuota=50%
+MemoryAccounting=true
+MemoryHigh=256M
+MemoryMax=512M
+TasksMax=16
+LimitNOFILE=1024
+NoNewPrivileges=true
+CapabilityBoundingSet=
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# Do not bind-mount /mnt/fsx into a private service namespace: host remounts must be visible.
+# Grant this account read/traverse access to the configured sources separately.
+# For a hard local disk budget, add a drop-in using the actual source block device:
+# IOReadBandwidthMax=/dev/nvme1n1 20M
+# IOReadIOPSMax=/dev/nvme1n1 100
+# IOWriteBandwidthMax=/dev/nvme1n1 5M
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,36 @@
+groups:
+  - name: logshipper
+    rules:
+      - alert: LogshipperUnavailable
+        expr: up{job="logshipper"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Logshipper monitoring is unreachable on {{ $labels.instance }}"
+      - alert: LogshipperNotReady
+        expr: logshipper_ready == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Logshipper is waiting, degraded, or stalled on {{ $labels.instance }}"
+      - alert: LogshipperErrors
+        expr: increase(logshipper_errors_total[15m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Logshipper reports repeated errors on {{ $labels.instance }}"
+      - alert: LogshipperIntegrityFailure
+        expr: increase(logshipper_integrity_failures_total[15m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "A resumed archive failed a checksum on {{ $labels.instance }}"
+      - alert: LogshipperTailSourceReset
+        expr: increase(logshipper_tail_resets_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "A tail source was truncated or overwritten on {{ $labels.instance }}; check rotation and retention"

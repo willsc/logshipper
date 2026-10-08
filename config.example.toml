@@ -1,0 +1,53 @@
+# Linux paths. Keep source logs until archiving succeeds, including through outages.
+state_dir = "/var/lib/logshipper"
+scan_interval_seconds = 30
+settle_seconds = 120
+buffer_bytes = 262144              # 256 KiB; memory does not scale with file size
+checkpoint_bytes = 67108864        # 64 MiB of source bytes between durable checkpoints
+state_retention_days = 30          # Prune completed local records, at most 1000 per scan
+min_state_free_bytes = 67108864     # Keep 64 MiB available on the local state disk
+
+[destination]
+mount_path = "/mnt/fsx"            # Exact mountpoint, not a subdirectory of it
+directory = "logshipper"           # Relative to the mountpoint
+namespace = "CHANGE-ME-hostname"    # Unique per host; do not share between writers
+require_mount = true               # Keep enabled in production
+allowed_filesystems = ["nfs", "nfs4"]
+# Copy the exact SOURCE from: findmnt -n -o SOURCE --mountpoint /mnt/fsx
+# expected_source = "svm.example.fsx.region.amazonaws.com:/archive-volume"
+min_free_bytes = 1073741824         # Keep at least 1 GiB free, plus room for the next chunk
+
+[io]
+read_bytes_per_second = 20971520   # 20 MiB/s shared across all sources
+write_bytes_per_second = 10485760  # 10 MiB/s of actual output (after compression)
+operations_per_second = 100       # Combined data read/write calls and checkpoint file syncs
+scan_entries_per_second = 100     # Directory traversal pace; not an exact metadata IOPS cap
+
+[compression]
+format = "zstd"                    # none | gzip | zstd
+level = 3                          # gzip: 0..9; zstd: 1..19
+skip_compressed = true             # Recognized magic bytes OR compression filename extensions
+
+[monitoring]
+listen = "127.0.0.1:9898"           # /metrics, /healthz, /readyz; no authentication, bind locally
+stall_seconds = 300                # Busy worker without progress becomes unready
+
+[tail]
+poll_seconds = 1                  # Idle polling interval; active backlog is drained without this delay
+flush_seconds = 5                 # Batch small appends for up to 5 seconds; full segments send sooner
+mem_buf_limit = 8388608            # Maximum unacknowledged source payload in memory (8 MiB)
+segment_bytes = 1048576            # One segment in flight; must not exceed mem_buf_limit
+
+[[sources]]
+name = "application"
+path = "/var/log/myapp"
+mode = "tail"                      # tail = live byte ranges; archive = settled whole files
+include = ["**/*.log", "**/*.log.*", "**/*.json", "**/*.json.*", "**/*.jsonl", "**/*.jsonl.*"]
+exclude = ["**/*.tmp", "**/*.partial"]
+
+# [[sources]]
+# name = "another-application"
+# path = "/srv/another-app/logs"
+# mode = "archive"
+# include = ["**/*.log.*", "**/*.json.*"]
+# exclude = []
